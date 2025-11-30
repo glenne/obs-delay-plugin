@@ -722,16 +722,21 @@ static const char *delay_meter_get_name(void *unused)
 }
 
 extern "C" {
-struct obs_source_info delay_meter_filter = {
-	.id = "audio-sync-analyzer",
-	.type = OBS_SOURCE_TYPE_FILTER,
-	.output_flags = OBS_SOURCE_AUDIO,
-	.get_name = delay_meter_get_name,
-	.create = delay_meter_create,
-	.destroy = delay_meter_destroy,
-	.update = delay_meter_update,
-	.get_properties = delay_meter_properties,
-	.get_defaults = delay_meter_defaults,
-	.filter_audio = delay_meter_filter_audio,
-};
+static obs_source_info make_delay_meter_filter_info()
+{
+	obs_source_info info = {};
+	info.id = "audio-sync-analyzer";
+	info.type = OBS_SOURCE_TYPE_FILTER;
+	info.output_flags = OBS_SOURCE_AUDIO;
+	info.get_name = delay_meter_get_name;
+	info.create = delay_meter_create;
+	info.destroy = delay_meter_destroy;
+	info.update = delay_meter_update;
+	info.get_defaults = delay_meter_defaults;
+	info.get_properties = delay_meter_properties;
+	info.filter_audio = delay_meter_filter_audio;
+	return info;
+}
+
+struct obs_source_info delay_meter_filter = make_delay_meter_filter_info();
 }

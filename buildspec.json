@@ -39,7 +39,7 @@
     "name": "audio-sync-analyzer",
     "displayName": "Audio Sync Analyzer",
     "description": "Analyze and compute audio sync between sources using cross-correlation.",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "author": "Glenn Engel",
     "website": "https://github.com/glenne/obs-audio-sync-analyzer",
     "email": "glenne@engel.org"

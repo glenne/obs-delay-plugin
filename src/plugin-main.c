@@ -22,7 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
-extern struct obs_source_info delay_meter_filter;
+extern struct obs_source_info audio_sync_filter;
 
 bool obs_module_load(void)
 {
@@ -30,7 +30,7 @@ bool obs_module_load(void)
 
 	/* Filter that estimates delay between two audio sources. Attach to the reference
 	 * (non-delayed) source and pick the delayed source in the filter properties. */
-	obs_register_source(&delay_meter_filter);
+	obs_register_source(&audio_sync_filter);
 	return true;
 }
 

@@ -19,6 +19,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <cstdint>
 #include <cmath>
 #include <complex>
+#include <string>
 #include <vector>
 
 #include <media-io/audio-io.h>
@@ -33,13 +34,19 @@ the Free Software Foundation; either version 2 of the License, or
 #define MAX_WINDOW_MS 3000u
 #define DEFAULT_WINDOW_MS 1000u
 #define MAX_LAG_MS 1500u
-#define MIN_CORR_THRESHOLD 0.6f
-#define PRE_EMPHASIS_ALPHA 0.95f
+#define MIN_CORR_THRESHOLD 0.4f
+#define BANDPASS_LOW_Hz 200.0f
+#define BANDPASS_HIGH_Hz 2000.0f
 
-struct delay_meter_data {
+struct bandpass_coeffs {
+	float b0, b1, b2, a1, a2;
+};
+
+struct audio_sync_data {
 	obs_source_t *context;
 	obs_source_t *target;
-	char *target_name;
+	std::string target_name;
+	std::string connected_target;
 
 	pthread_mutex_t lock;
 
@@ -57,11 +64,15 @@ struct delay_meter_data {
 	enum audio_format audio_format;
 	uint32_t window_ms;
 	uint32_t max_lag_ms;
+	float corr_threshold;
 	bool debug_enabled;
 
-	char *last_delay_text;
-	char *last_time_text;
-	char *last_notes;
+	// Bandpass filter coefficients (state is reset for each measurement)
+	struct bandpass_coeffs bp_coeffs;
+
+	std::string last_delay_text;
+	std::string last_time_text;
+	std::string last_notes;
 	double last_delay_ms;
 	float last_correlation;
 	bool ui_update_pending;
@@ -111,31 +122,75 @@ static const float *as_float_channel(const uint8_t *const *planes, enum audio_fo
 	return nullptr;
 }
 
-static void apply_pre_emphasis(float *data, size_t frames)
+static void design_bandpass_filter(float low_freq, float high_freq, uint32_t sample_rate,
+				   struct bandpass_coeffs *coeffs)
 {
-	if (frames < 2)
+	// Design a second-order bandpass filter using biquad structure
+	// This implements a bandpass filter with center frequency and Q
+
+	const float center_freq = sqrtf(low_freq * high_freq);
+	const float bandwidth = high_freq - low_freq;
+	const float Q = center_freq / bandwidth;
+
+	const float w0 = 2.0f * (float)M_PI * center_freq / (float)sample_rate;
+	const float cos_w0 = cosf(w0);
+	const float sin_w0 = sinf(w0);
+	const float alpha = sin_w0 / (2.0f * Q);
+
+	const float b0_val = alpha;
+	const float b1_val = 0.0f;
+	const float b2_val = -alpha;
+	const float a0_val = 1.0f + alpha;
+	const float a1_val = -2.0f * cos_w0;
+	const float a2_val = 1.0f - alpha;
+
+	// Normalize coefficients
+	coeffs->b0 = b0_val / a0_val;
+	coeffs->b1 = b1_val / a0_val;
+	coeffs->b2 = b2_val / a0_val;
+	coeffs->a1 = a1_val / a0_val;
+	coeffs->a2 = a2_val / a0_val;
+}
+
+static void apply_bandpass_filter(float *data, size_t samples, const struct bandpass_coeffs *coeffs)
+{
+	if (samples == 0)
 		return;
 
-	float prev = data[0];
-	for (size_t i = 1; i < frames; ++i) {
-		float next = data[i];
-		data[i] = next - PRE_EMPHASIS_ALPHA * prev;
-		prev = next;
+	// Initialize filter state to zero for independent measurements
+	float x_prev1 = 0.0f;
+	float x_prev2 = 0.0f;
+	float y_prev1 = 0.0f;
+	float y_prev2 = 0.0f;
+
+	for (size_t i = 0; i < samples; ++i) {
+		const float x = data[i];
+
+		// Direct Form II transposed biquad filter
+		const float y = coeffs->b0 * x + coeffs->b1 * x_prev1 + coeffs->b2 * x_prev2 - coeffs->a1 * y_prev1 -
+				coeffs->a2 * y_prev2;
+
+		x_prev2 = x_prev1;
+		x_prev1 = x;
+		y_prev2 = y_prev1;
+		y_prev1 = y;
+
+		data[i] = y;
 	}
 }
 
-static void apply_hann_window(float *data, size_t frames)
+static void apply_hann_window(float *data, size_t samples)
 {
-	if (frames <= 1)
+	if (samples <= 1)
 		return;
 
-	for (size_t i = 0; i < frames; ++i) {
-		double w = 0.5 * (1.0 - cos(2.0 * M_PI * (double)i / (frames - 1.0)));
+	for (size_t i = 0; i < samples; ++i) {
+		double w = 0.5 * (1.0 - cos(2.0 * M_PI * (double)i / (samples - 1.0)));
 		data[i] *= (float)w;
 	}
 }
 
-static bool copy_recent(struct delay_meter_data *dm, float **out_ref, float **out_tgt, size_t *out_frames)
+static bool copy_recent(struct audio_sync_data *dm, float **out_ref, float **out_tgt, size_t *out_frames)
 {
 	float *ref = nullptr;
 	float *tgt = nullptr;
@@ -168,8 +223,10 @@ static bool copy_recent(struct delay_meter_data *dm, float **out_ref, float **ou
 		tgt[i] = dm->tgt_buffer[(tgt_start + i) % dm->capacity];
 	}
 
-	apply_pre_emphasis(ref, frames);
-	apply_pre_emphasis(tgt, frames);
+	// Apply bandpass filter instead of pre-emphasis
+	apply_bandpass_filter(ref, frames, &dm->bp_coeffs);
+	apply_bandpass_filter(tgt, frames, &dm->bp_coeffs);
+
 	apply_hann_window(ref, frames);
 	apply_hann_window(tgt, frames);
 
@@ -181,7 +238,7 @@ static bool copy_recent(struct delay_meter_data *dm, float **out_ref, float **ou
 	return true;
 }
 
-static bool estimate_delay(struct delay_meter_data *dm, double *delay_ms_out, double *corr_out)
+static bool estimate_delay(struct audio_sync_data *dm, double *delay_ms_out, double *corr_out)
 {
 	float *ref = nullptr;
 	float *tgt = nullptr;
@@ -294,8 +351,8 @@ static bool estimate_delay(struct delay_meter_data *dm, double *delay_ms_out, do
 		     lag_count);
 	}
 
-	if (best_corr < MIN_CORR_THRESHOLD) {
-		blog(LOG_INFO, "[ADM]  CORRELATION TOO LOW: %.4f < %.1f", best_corr, MIN_CORR_THRESHOLD);
+	if (best_corr < dm->corr_threshold) {
+		blog(LOG_INFO, "[ADM]  CORRELATION TOO LOW: %.4f < %.2f", best_corr, dm->corr_threshold);
 		return false;
 	}
 
@@ -304,7 +361,7 @@ static bool estimate_delay(struct delay_meter_data *dm, double *delay_ms_out, do
 	return true;
 }
 
-static void set_result(struct delay_meter_data *dm, const char *delay_text, const char *notes_text)
+static void set_result(struct audio_sync_data *dm, const char *delay_text, const char *notes_text)
 {
 	if (!dm || !delay_text)
 		return;
@@ -318,12 +375,9 @@ static void set_result(struct delay_meter_data *dm, const char *delay_text, cons
 
 	bool queue = false;
 	pthread_mutex_lock(&dm->lock);
-	bfree(dm->last_delay_text);
-	bfree(dm->last_time_text);
-	bfree(dm->last_notes);
-	dm->last_delay_text = bstrdup(delay_text);
-	dm->last_time_text = bstrdup(timestamp);
-	dm->last_notes = notes_text ? bstrdup(notes_text) : bstrdup("");
+	dm->last_delay_text = delay_text;
+	dm->last_time_text = timestamp;
+	dm->last_notes = notes_text ? notes_text : "";
 	dm->last_delay_valid = true;
 	if (!dm->ui_update_pending) {
 		dm->ui_update_pending = true;
@@ -337,39 +391,32 @@ static void set_result(struct delay_meter_data *dm, const char *delay_text, cons
 
 static void apply_result_ui(void *param)
 {
-	auto *dm = static_cast<delay_meter_data *>(param);
+	auto *dm = static_cast<audio_sync_data *>(param);
 	if (!dm || !dm->context)
 		return;
 
 	blog(LOG_INFO, "[ADM DEBUG] Apply Result");
-	char *result = nullptr;
-	char *time_txt = nullptr;
-	char *notes_txt = nullptr;
+	std::string result;
+	std::string time_txt;
+	std::string notes_txt;
 	pthread_mutex_lock(&dm->lock);
 	dm->ui_update_pending = false;
-	if (dm->last_delay_text)
-		result = bstrdup(dm->last_delay_text);
-	if (dm->last_time_text)
-		time_txt = bstrdup(dm->last_time_text);
-	if (dm->last_notes)
-		notes_txt = bstrdup(dm->last_notes);
+	result = dm->last_delay_text;
+	time_txt = dm->last_time_text;
+	notes_txt = dm->last_notes;
 	pthread_mutex_unlock(&dm->lock);
 
-	if (!result)
+	if (result.empty())
 		return;
 
 	obs_data_t *settings = obs_source_get_settings(dm->context);
 	if (settings) {
-		obs_data_set_string(settings, "time_result", time_txt ? time_txt : "");
-		obs_data_set_string(settings, "delay_result", result);
-		obs_data_set_string(settings, "notes", notes_txt ? notes_txt : "");
+		obs_data_set_string(settings, "time_result", time_txt.c_str());
+		obs_data_set_string(settings, "delay_result", result.c_str());
+		obs_data_set_string(settings, "notes", notes_txt.c_str());
 		obs_source_update(dm->context, settings);
 		obs_data_release(settings);
 	}
-
-	bfree(result);
-	bfree(time_txt);
-	bfree(notes_txt);
 }
 
 static void capture_target(void *param, obs_source_t *source, const struct audio_data *audio, bool muted)
@@ -377,7 +424,7 @@ static void capture_target(void *param, obs_source_t *source, const struct audio
 	UNUSED_PARAMETER(source);
 	UNUSED_PARAMETER(muted);
 
-	auto *dm = static_cast<delay_meter_data *>(param);
+	auto *dm = static_cast<audio_sync_data *>(param);
 	if (!dm)
 		return;
 
@@ -388,68 +435,65 @@ static void capture_target(void *param, obs_source_t *source, const struct audio
 	pthread_mutex_lock(&dm->lock);
 	ring_write(dm->tgt_buffer, dm->capacity, &dm->tgt_pos, &dm->tgt_count, samples, audio->frames);
 	dm->last_tgt_ns = os_gettime_ns();
-	// blog(LOG_INFO, "[DEBUG] Target buffer: %zu frames", dm->tgt_count);
-	// if (audio->frames > 0) {
-	//     blog(LOG_DEBUG, "[ADM] Target: %u → %zu", audio->frames, dm->tgt_count);
-	// }
 	pthread_mutex_unlock(&dm->lock);
 }
 
-static void connect_target(struct delay_meter_data *dm, const char *name, bool log_missing)
+static void connect_target(struct audio_sync_data *dm)
 {
-	if (dm->target && dm->target_name && name && strcmp(dm->target_name, name) == 0)
+	if (dm->target && dm->connected_target == dm->target_name) {
+		// nothing has changed, ignore
 		return;
+	}
+	if (dm->target_name.empty())
+		return;
+	if (dm->debug_enabled) {
+		blog(LOG_INFO, "[ADM TRACE] Connect Target");
+	}
 
 	if (dm->target) {
 		blog(LOG_INFO, "Releasing prior audio callback");
 		obs_source_remove_audio_capture_callback(dm->target, capture_target, dm);
 		obs_source_release(dm->target);
 		dm->target = nullptr;
+		dm->connected_target="";
 		dm->tgt_count = 0;
 		dm->tgt_pos = 0;
 		dm->last_tgt_ns = 0;
 	}
 
-	blog(LOG_INFO, "[ADM Info] Connecting to %s", name);
+	blog(LOG_INFO, "[ADM Info] Connecting to %s", dm->target_name.c_str());
 
-	if (dm->target_name) {
-		bfree(dm->target_name);
-	}
-	dm->target_name = name && *name ? bstrdup(name) : nullptr;
-
-	if (!dm->target_name)
-		return;
-
-	obs_source_t *src = obs_get_source_by_name(dm->target_name);
+	obs_source_t *src = obs_get_source_by_name(dm->target_name.c_str());
 	if (!src) {
-		if (log_missing) {
-			blog(LOG_INFO, "[ADM] Target '%s' not yet available", dm->target_name);
-		}
+		blog(LOG_INFO, "[ADM] Target '%s' not yet available", dm->target_name.c_str());
+		// OK to leave target_name set
 		return;
 	}
 
 	dm->target = src;
+	dm->connected_target = dm->target_name;
 	obs_source_add_audio_capture_callback(dm->target, capture_target, dm);
+	blog(LOG_INFO, "[ADM Info] Connected to %s", dm->target_name.c_str());
 }
 
-static void delay_meter_update(void *data, obs_data_t *settings)
+static void audio_sync_update(void *data, obs_data_t *settings)
 {
-	auto *dm = static_cast<delay_meter_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(data);
 	if (!dm)
 		return;
 
 	blog(LOG_INFO, "[ADM TRACE] Meter Update");
 	dm->window_ms = (uint32_t)obs_data_get_int(settings, "window_ms");
 	dm->max_lag_ms = (uint32_t)obs_data_get_int(settings, "max_lag_ms");
+	dm->corr_threshold = (float)obs_data_get_double(settings, "corr_threshold");
 	dm->debug_enabled = obs_data_get_bool(settings, "debug_enabled");
-
-	const char *target = obs_data_get_string(settings, "target_source");
-	connect_target(dm, target, true);
+	dm->target_name = obs_data_get_string(settings, "target_source");
 	dm->last_ref_ns = 0;
 	dm->last_tgt_ns = 0;
+	connect_target(dm);
 }
 
-static bool perform_measure(struct delay_meter_data *dm)
+static bool perform_measure(struct audio_sync_data *dm)
 {
 	if (dm->debug_enabled) {
 		blog(LOG_INFO, "[ADM DIAG] Starting measurement");
@@ -472,13 +516,6 @@ static bool perform_measure(struct delay_meter_data *dm)
 	last_tgt_ns = dm->last_tgt_ns;
 	pthread_mutex_unlock(&dm->lock);
 
-	if (!enough) {
-		set_result(dm, "Buffers too small",
-			   "Need more buffered audio from both reference and target before measuring.");
-		dm->last_delay_valid = false;
-		return false;
-	}
-
 	const uint64_t now_ns = os_gettime_ns();
 	const uint64_t max_age_ns = (uint64_t)(dm->window_ms + dm->max_lag_ms + 200u) * 1000000ULL; // grace window
 
@@ -494,38 +531,43 @@ static bool perform_measure(struct delay_meter_data *dm)
 		return false;
 	}
 
+	if (!enough) {
+		set_result(dm, "Not enough audio data available",
+			   "Need more buffered audio from both reference and target before measuring.");
+		dm->last_delay_valid = false;
+		return false;
+	}
+
 	double delay_ms = 0.0;
 	double corr = 0.0;
 
 	blog(LOG_INFO, "[ADM] Estimating Audio Delay");
 	if (estimate_delay(dm, &delay_ms, &corr)) {
-		char *target_name_copy = nullptr;
+	std::string target_name_copy;
 
-		pthread_mutex_lock(&dm->lock);
-		target_name_copy = dm->target_name ? bstrdup(dm->target_name) : nullptr;
-		pthread_mutex_unlock(&dm->lock);
+	pthread_mutex_lock(&dm->lock);
+	target_name_copy = dm->target_name;
+	pthread_mutex_unlock(&dm->lock);
 
-		char buffer[256];
-		snprintf(buffer, sizeof(buffer), "%+6.1f ms (correlation: %.2f)", delay_ms, corr);
-		char notes_buf[256];
-		if (delay_ms > 0) {
-			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' lags reference by %.1f ms",
-				 target_name_copy ? target_name_copy : "<target>", delay_ms);
-		} else if (delay_ms < 0) {
-			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' leads reference by %.1f ms",
-				 target_name_copy ? target_name_copy : "<target>", fabs(delay_ms));
-		} else {
-			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' is aligned with reference",
-				 target_name_copy ? target_name_copy : "<target>");
-		}
-
-		set_result(dm, buffer, notes_buf);
-		dm->last_delay_ms = delay_ms;
-		dm->last_delay_valid = true;
-
-		bfree(target_name_copy);
-		return true;
+	char buffer[256];
+	snprintf(buffer, sizeof(buffer), "%+6.1f ms (correlation: %.2f)", delay_ms, corr);
+	char notes_buf[256];
+	if (delay_ms > 0) {
+		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' lags reference by %.1f ms",
+			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", delay_ms);
+	} else if (delay_ms < 0) {
+		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' leads reference by %.1f ms",
+			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", fabs(delay_ms));
+	} else {
+		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' is aligned with reference",
+			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>");
 	}
+
+	set_result(dm, buffer, notes_buf);
+	dm->last_delay_ms = delay_ms;
+	dm->last_delay_valid = true;
+	return true;
+}
 
 	set_result(dm, "Insufficient correlation - check audio levels and similarity",
 		   "Insufficient correlation; ensure both sources carry similar program audio.");
@@ -538,7 +580,7 @@ static bool measure_now_clicked(obs_properties_t *props, obs_property_t *propert
 {
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
-	auto *dm = static_cast<delay_meter_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(data);
 	/* Always return true so OBS refreshes the properties view even when measurement
 	 * fails (e.g., missing target or not enough buffered audio). */
 	perform_measure(dm);
@@ -549,7 +591,7 @@ static bool apply_sync_offset_clicked(obs_properties_t *props, obs_property_t *p
 {
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
-	auto *dm = static_cast<delay_meter_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(data);
 	if (!dm)
 		return true;
 
@@ -585,14 +627,14 @@ static bool apply_sync_offset_clicked(obs_properties_t *props, obs_property_t *p
 	return true;
 }
 
-static struct obs_audio_data *delay_meter_filter_audio(void *data, struct obs_audio_data *audio)
+static struct obs_audio_data *audio_sync_filter_audio(void *data, struct obs_audio_data *audio)
 {
-	auto *dm = static_cast<delay_meter_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(data);
 	if (!dm)
 		return audio;
 
-	if (!dm->target && dm->target_name)
-		connect_target(dm, dm->target_name, false);
+	if (!dm->target)
+		connect_target(dm);
 
 	if (!dm->target) {
 		return audio;
@@ -608,31 +650,28 @@ static struct obs_audio_data *delay_meter_filter_audio(void *data, struct obs_au
 	return audio;
 }
 
-static void delay_meter_destroy(void *data)
+static void audio_sync_destroy(void *data)
 {
 	blog(LOG_INFO, "[ADM Trace] Destroy");
-	auto *dm = static_cast<delay_meter_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(data);
 	if (!dm)
 		return;
 
 	if (dm->target) {
 		obs_source_remove_audio_capture_callback(dm->target, capture_target, dm);
 		obs_source_release(dm->target);
+		dm->target=nullptr;
 	}
 
 	pthread_mutex_destroy(&dm->lock);
 	bfree(dm->ref_buffer);
 	bfree(dm->tgt_buffer);
-	bfree(dm->target_name);
-	bfree(dm->last_delay_text);
-	bfree(dm->last_time_text);
-	bfree(dm->last_notes);
 	bfree(dm);
 }
 
-static void *delay_meter_create(obs_data_t *settings, obs_source_t *context)
+static void *audio_sync_create(obs_data_t *settings, obs_source_t *context)
 {
-	struct delay_meter_data *dm = static_cast<delay_meter_data *>(bzalloc(sizeof(*dm)));
+	struct audio_sync_data *dm = static_cast<audio_sync_data *>(bzalloc(sizeof(*dm)));
 	dm->context = context;
 	pthread_mutex_init(&dm->lock, nullptr);
 
@@ -646,16 +685,18 @@ static void *delay_meter_create(obs_data_t *settings, obs_source_t *context)
 	dm->tgt_count = dm->ref_count = 0;
 
 	dm->last_delay_valid = false;
+	dm->target_name = obs_data_get_string(settings, "target_source");
 	dm->debug_enabled = obs_data_get_bool(settings, "debug_enabled");
 	dm->window_ms = (uint32_t)obs_data_get_int(settings, "window_ms");
 	dm->max_lag_ms = (uint32_t)obs_data_get_int(settings, "max_lag_ms");
+	dm->corr_threshold = (float)obs_data_get_double(settings, "corr_threshold");
+
+	// Initialize bandpass filter coefficients
+	design_bandpass_filter(BANDPASS_LOW_Hz, BANDPASS_HIGH_Hz, dm->sample_rate, &dm->bp_coeffs);
 
 	obs_data_set_string(settings, "time_result", "");
 	obs_data_set_string(settings, "delay_result", "Ready...");
 	obs_data_set_string(settings, "notes", "");
-
-	const char *target = obs_data_get_string(settings, "target_source");
-	connect_target(dm, target, true);
 
 	blog(LOG_INFO, "[ADM TRACE] Created");
 	return dm;
@@ -673,7 +714,7 @@ static bool add_audio_sources(void *priv, obs_source_t *src)
 	return true;
 }
 
-static obs_properties_t *delay_meter_properties(void *data)
+static obs_properties_t *audio_sync_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	blog(LOG_INFO, "[ADM TRACE] Creating Properties");
@@ -683,8 +724,8 @@ static obs_properties_t *delay_meter_properties(void *data)
 						       OBS_COMBO_FORMAT_STRING);
 	obs_enum_sources(add_audio_sources, list);
 
-	obs_properties_add_int_slider(props, "window_ms", "Analysis Window (ms)", MIN_WINDOW_MS, MAX_WINDOW_MS, 50);
-	obs_properties_add_int_slider(props, "max_lag_ms", "Max Lag Search (ms)", 50, MAX_LAG_MS, 25);
+	obs_properties_add_button2(props, "measure_now", "Measure Now", measure_now_clicked, data);
+	obs_properties_add_button2(props, "apply_sync_offset", "Apply Sync Offset", apply_sync_offset_clicked, data);
 
 	obs_property_t *time_prop = obs_properties_add_text(props, "time_result", "Time", OBS_TEXT_INFO);
 	obs_property_set_enabled(time_prop, false);
@@ -695,19 +736,20 @@ static obs_properties_t *delay_meter_properties(void *data)
 	obs_property_t *notes = obs_properties_add_text(props, "notes", "Notes", OBS_TEXT_INFO);
 	obs_property_set_enabled(notes, false);
 
-	obs_properties_add_button2(props, "measure_now", "Measure Now", measure_now_clicked, data);
-	obs_properties_add_button2(props, "apply_sync_offset", "Apply to Sync Offset", apply_sync_offset_clicked, data);
-
+	obs_properties_add_int_slider(props, "window_ms", "Window (ms)", MIN_WINDOW_MS, MAX_WINDOW_MS, 50);
+	obs_properties_add_int_slider(props, "max_lag_ms", "Max Lag (ms)", 50, MAX_LAG_MS, 25);
+	obs_properties_add_float_slider(props, "corr_threshold", "Correlation", 0.0, 1.0, 0.01);
 	obs_properties_add_bool(props, "debug_enabled", "Enable Debug Logging");
 
 	return props;
 }
 
-static void delay_meter_defaults(obs_data_t *settings)
+static void audio_sync_defaults(obs_data_t *settings)
 {
 	blog(LOG_INFO, "[ADM TRACE] Setting Defaults");
 	obs_data_set_default_int(settings, "window_ms", DEFAULT_WINDOW_MS);
 	obs_data_set_default_int(settings, "max_lag_ms", 500);
+	obs_data_set_default_double(settings, "corr_threshold", (double)MIN_CORR_THRESHOLD);
 	obs_data_set_default_bool(settings, "debug_enabled", false);
 	obs_data_set_default_string(settings, "delay_result", "Ready...");
 	obs_data_set_default_string(settings, "time_result", "");
@@ -715,28 +757,28 @@ static void delay_meter_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "target_source", "");
 }
 
-static const char *delay_meter_get_name(void *unused)
+static const char *audio_sync_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
 	return "Audio Sync Analyzer";
 }
 
 extern "C" {
-static obs_source_info make_delay_meter_filter_info()
+static obs_source_info make_audio_sync_filter_info()
 {
 	obs_source_info info = {};
 	info.id = "audio-sync-analyzer";
 	info.type = OBS_SOURCE_TYPE_FILTER;
 	info.output_flags = OBS_SOURCE_AUDIO;
-	info.get_name = delay_meter_get_name;
-	info.create = delay_meter_create;
-	info.destroy = delay_meter_destroy;
-	info.update = delay_meter_update;
-	info.get_defaults = delay_meter_defaults;
-	info.get_properties = delay_meter_properties;
-	info.filter_audio = delay_meter_filter_audio;
+	info.get_name = audio_sync_get_name;
+	info.create = audio_sync_create;
+	info.destroy = audio_sync_destroy;
+	info.update = audio_sync_update;
+	info.get_defaults = audio_sync_defaults;
+	info.get_properties = audio_sync_properties;
+	info.filter_audio = audio_sync_filter_audio;
 	return info;
 }
 
-struct obs_source_info delay_meter_filter = make_delay_meter_filter_info();
+struct obs_source_info audio_sync_filter = make_audio_sync_filter_info();
 }

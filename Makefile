@@ -19,6 +19,9 @@ all: build
 configure:
 	$(CMAKE) --preset $(PRESET)
 
+buildonly: 
+	$(CMAKE) --build --preset $(PRESET)
+
 build: configure
 	$(CMAKE) --build --preset $(PRESET)
 

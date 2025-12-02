@@ -18,23 +18,24 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <obs-frontend-api.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
-extern struct obs_source_info audio_sync_filter;
+void audio_sync_frontend_init_module(void);
+void audio_sync_frontend_shutdown_module(void);
 
 bool obs_module_load(void)
 {
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 
-	/* Filter that estimates delay between two audio sources. Attach to the reference
-	 * (non-delayed) source and pick the delayed source in the filter properties. */
-	obs_register_source(&audio_sync_filter);
+	audio_sync_frontend_init_module();
 	return true;
 }
 
 void obs_module_unload(void)
 {
+	audio_sync_frontend_shutdown_module();
 	obs_log(LOG_INFO, "plugin unloaded");
 }

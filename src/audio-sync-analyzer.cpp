@@ -22,6 +22,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <string>
 #include <vector>
 
+#include <obs-frontend-api.h>
 #include <media-io/audio-io.h>
 #include <obs-module.h>
 #include <util/bmem.h>
@@ -42,10 +43,18 @@ struct bandpass_coeffs {
 	float b0, b1, b2, a1, a2;
 };
 
+struct audio_sync_data;
+static audio_sync_data *g_dm = nullptr;
+
+static void connect_ref(struct audio_sync_data *dm);
+static void connect_target(struct audio_sync_data *dm);
+
 struct audio_sync_data {
-	obs_source_t *context;
+	obs_source_t *ref;
 	obs_source_t *target;
+	std::string ref_name;
 	std::string target_name;
+	std::string connected_ref;
 	std::string connected_target;
 
 	pthread_mutex_t lock;
@@ -70,14 +79,19 @@ struct audio_sync_data {
 	// Bandpass filter coefficients (state is reset for each measurement)
 	struct bandpass_coeffs bp_coeffs;
 
-	std::string last_delay_text;
+	std::string last_delay_text = "---";
 	std::string last_time_text;
 	std::string last_notes;
 	double last_delay_ms;
 	float last_correlation;
-	bool ui_update_pending;
 	bool last_delay_valid;
+	bool average_in_progress;
+	bool average_stop;
+	bool average_thread_active;
+	pthread_t average_thread;
 };
+
+static void update_dock_ui(audio_sync_data *dm);
 
 static size_t next_power_of_2(size_t n)
 {
@@ -91,8 +105,6 @@ static size_t ms_to_samples(uint32_t ms, uint32_t sample_rate)
 {
 	return (size_t)(((uint64_t)ms * sample_rate + 500) / 1000);
 }
-
-static void apply_result_ui(void *param);
 
 static void ring_write(float *buffer, size_t capacity, size_t *pos, size_t *count, const float *src, size_t frames)
 {
@@ -187,6 +199,53 @@ static void apply_hann_window(float *data, size_t samples)
 	for (size_t i = 0; i < samples; ++i) {
 		double w = 0.5 * (1.0 - cos(2.0 * M_PI * (double)i / (samples - 1.0)));
 		data[i] *= (float)w;
+	}
+}
+
+static void frontend_save_cb(obs_data_t *settings, bool saving, void *private_data)
+{
+	auto *dm = static_cast<audio_sync_data *>(private_data);
+	if (!dm || !settings)
+		return;
+
+	const char *key = "audio_sync_analyzer";
+
+	if (saving) {
+		obs_data_t *obj = obs_data_create();
+		pthread_mutex_lock(&dm->lock);
+		obs_data_set_string(obj, "ref_name", dm->ref_name.c_str());
+		obs_data_set_string(obj, "target_name", dm->target_name.c_str());
+		obs_data_set_int(obj, "window_ms", dm->window_ms);
+		obs_data_set_int(obj, "max_lag_ms", dm->max_lag_ms);
+		obs_data_set_double(obj, "corr_threshold", dm->corr_threshold);
+		obs_data_set_bool(obj, "debug_enabled", dm->debug_enabled);
+		pthread_mutex_unlock(&dm->lock);
+
+		obs_data_set_obj(settings, key, obj);
+		obs_data_release(obj);
+		blog(LOG_INFO, "[ASM] saved frontend settings");
+	} else {
+		obs_data_t *obj = obs_data_get_obj(settings, key);
+		if (!obj)
+			return;
+
+		pthread_mutex_lock(&dm->lock);
+		dm->ref_name = obs_data_get_string(obj, "ref_name");
+		dm->target_name = obs_data_get_string(obj, "target_name");
+		uint32_t win = (uint32_t)obs_data_get_int(obj, "window_ms");
+		uint32_t lag = (uint32_t)obs_data_get_int(obj, "max_lag_ms");
+		double corr = obs_data_get_double(obj, "corr_threshold");
+		dm->window_ms = win ? win : DEFAULT_WINDOW_MS;
+		dm->max_lag_ms = lag ? lag : 500;
+		dm->corr_threshold = (float)(corr > 0.0 ? corr : MIN_CORR_THRESHOLD);
+		dm->debug_enabled = obs_data_get_bool(obj, "debug_enabled");
+		pthread_mutex_unlock(&dm->lock);
+
+		obs_data_release(obj);
+		connect_ref(dm);
+		connect_target(dm);
+		update_dock_ui(dm);
+		blog(LOG_INFO, "[ASM] loaded frontend settings");
 	}
 }
 
@@ -361,62 +420,24 @@ static bool estimate_delay(struct audio_sync_data *dm, double *delay_ms_out, dou
 	return true;
 }
 
-static void set_result(struct audio_sync_data *dm, const char *delay_text, const char *notes_text)
+static void set_result(struct audio_sync_data *dm, const char *delay_text, const char *notes_text, bool valid)
 {
 	if (!dm || !delay_text)
 		return;
-
-	blog(LOG_INFO, "[ADM DEBUG] Set Result=%s", delay_text);
 
 	time_t now = time(nullptr);
 	struct tm *tm_info = localtime(&now);
 	char timestamp[10];
 	strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
 
-	bool queue = false;
 	pthread_mutex_lock(&dm->lock);
 	dm->last_delay_text = delay_text;
 	dm->last_time_text = timestamp;
 	dm->last_notes = notes_text ? notes_text : "";
-	dm->last_delay_valid = true;
-	if (!dm->ui_update_pending) {
-		dm->ui_update_pending = true;
-		queue = true;
-	}
+	dm->last_delay_valid = valid;
 	pthread_mutex_unlock(&dm->lock);
 
-	if (queue)
-		obs_queue_task(OBS_TASK_UI, apply_result_ui, dm, false);
-}
-
-static void apply_result_ui(void *param)
-{
-	auto *dm = static_cast<audio_sync_data *>(param);
-	if (!dm || !dm->context)
-		return;
-
-	blog(LOG_INFO, "[ADM DEBUG] Apply Result");
-	std::string result;
-	std::string time_txt;
-	std::string notes_txt;
-	pthread_mutex_lock(&dm->lock);
-	dm->ui_update_pending = false;
-	result = dm->last_delay_text;
-	time_txt = dm->last_time_text;
-	notes_txt = dm->last_notes;
-	pthread_mutex_unlock(&dm->lock);
-
-	if (result.empty())
-		return;
-
-	obs_data_t *settings = obs_source_get_settings(dm->context);
-	if (settings) {
-		obs_data_set_string(settings, "time_result", time_txt.c_str());
-		obs_data_set_string(settings, "delay_result", result.c_str());
-		obs_data_set_string(settings, "notes", notes_txt.c_str());
-		obs_source_update(dm->context, settings);
-		obs_data_release(settings);
-	}
+	update_dock_ui(dm);
 }
 
 static void capture_target(void *param, obs_source_t *source, const struct audio_data *audio, bool muted)
@@ -438,6 +459,56 @@ static void capture_target(void *param, obs_source_t *source, const struct audio
 	pthread_mutex_unlock(&dm->lock);
 }
 
+static void capture_ref(void *param, obs_source_t *source, const struct audio_data *audio, bool muted)
+{
+	UNUSED_PARAMETER(source);
+	UNUSED_PARAMETER(muted);
+
+	auto *dm = static_cast<audio_sync_data *>(param);
+	if (!dm)
+		return;
+
+	const float *samples = as_float_channel((const uint8_t *const *)audio->data, dm->audio_format);
+	if (!samples || audio->frames == 0)
+		return;
+
+	pthread_mutex_lock(&dm->lock);
+	ring_write(dm->ref_buffer, dm->capacity, &dm->ref_pos, &dm->ref_count, samples, audio->frames);
+	dm->last_ref_ns = os_gettime_ns();
+	pthread_mutex_unlock(&dm->lock);
+}
+
+static void connect_ref(struct audio_sync_data *dm)
+{
+	if (dm->ref && dm->ref_name == dm->connected_ref) {
+		return;
+	}
+	if (dm->ref_name.empty())
+		return;
+	if (dm->debug_enabled) {
+		blog(LOG_INFO, "[ADM TRACE] Connect Ref");
+	}
+
+	if (dm->ref) {
+		obs_source_remove_audio_capture_callback(dm->ref, capture_ref, dm);
+		obs_source_release(dm->ref);
+		dm->ref = nullptr;
+		dm->ref_count = 0;
+		dm->ref_pos = 0;
+		dm->last_ref_ns = 0;
+	}
+
+	obs_source_t *src = obs_get_source_by_name(dm->ref_name.c_str());
+	if (!src) {
+		blog(LOG_INFO, "[ADM] Ref '%s' not yet available", dm->ref_name.c_str());
+		return;
+	}
+
+	dm->ref = src;
+	dm->connected_ref = dm->ref_name;
+	obs_source_add_audio_capture_callback(dm->ref, capture_ref, dm);
+}
+
 static void connect_target(struct audio_sync_data *dm)
 {
 	if (dm->target && dm->connected_target == dm->target_name) {
@@ -455,7 +526,7 @@ static void connect_target(struct audio_sync_data *dm)
 		obs_source_remove_audio_capture_callback(dm->target, capture_target, dm);
 		obs_source_release(dm->target);
 		dm->target = nullptr;
-		dm->connected_target="";
+		dm->connected_target = "";
 		dm->tgt_count = 0;
 		dm->tgt_pos = 0;
 		dm->last_tgt_ns = 0;
@@ -476,21 +547,62 @@ static void connect_target(struct audio_sync_data *dm)
 	blog(LOG_INFO, "[ADM Info] Connected to %s", dm->target_name.c_str());
 }
 
-static void audio_sync_update(void *data, obs_data_t *settings)
-{
-	auto *dm = static_cast<audio_sync_data *>(data);
-	if (!dm)
-		return;
+struct measurement_sample {
+	double delay_ms = 0.0;
+	double correlation = 0.0;
+	bool success = false;
+	std::string status;
+};
 
-	blog(LOG_INFO, "[ADM TRACE] Meter Update");
-	dm->window_ms = (uint32_t)obs_data_get_int(settings, "window_ms");
-	dm->max_lag_ms = (uint32_t)obs_data_get_int(settings, "max_lag_ms");
-	dm->corr_threshold = (float)obs_data_get_double(settings, "corr_threshold");
-	dm->debug_enabled = obs_data_get_bool(settings, "debug_enabled");
-	dm->target_name = obs_data_get_string(settings, "target_source");
-	dm->last_ref_ns = 0;
-	dm->last_tgt_ns = 0;
-	connect_target(dm);
+static bool try_measure_once(struct audio_sync_data *dm, measurement_sample &out)
+{
+	if (!dm || !dm->target) {
+		out.status = "No target source";
+		return false;
+	}
+
+	uint64_t last_ref_ns = 0;
+	uint64_t last_tgt_ns = 0;
+	size_t ref_count = 0;
+	size_t tgt_count = 0;
+
+	pthread_mutex_lock(&dm->lock);
+	ref_count = dm->ref_count;
+	tgt_count = dm->tgt_count;
+	last_ref_ns = dm->last_ref_ns;
+	last_tgt_ns = dm->last_tgt_ns;
+	pthread_mutex_unlock(&dm->lock);
+
+	if (ref_count < 1024 || tgt_count < 1024) {
+		out.status = "Buffers too small";
+		return false;
+	}
+
+	const uint64_t now_ns = os_gettime_ns();
+	const uint64_t max_age_ns = (uint64_t)(dm->window_ms + dm->max_lag_ms + 200u) * 1000000ULL;
+
+	if (!has_recent_audio(last_ref_ns, now_ns, max_age_ns)) {
+		out.status = "Reference inactive";
+		return false;
+	}
+
+	if (!has_recent_audio(last_tgt_ns, now_ns, max_age_ns)) {
+		out.status = "Target inactive";
+		return false;
+	}
+
+	double delay_ms = 0.0;
+	double corr = 0.0;
+	if (!estimate_delay(dm, &delay_ms, &corr)) {
+		out.status = "Insufficient correlation";
+		return false;
+	}
+
+	out.delay_ms = delay_ms;
+	out.correlation = corr;
+	out.success = true;
+	out.status.clear();
+	return true;
 }
 
 static bool perform_measure(struct audio_sync_data *dm)
@@ -499,9 +611,13 @@ static bool perform_measure(struct audio_sync_data *dm)
 		blog(LOG_INFO, "[ADM DIAG] Starting measurement");
 	}
 
-	if (!dm || !dm->target) {
-		set_result(dm, "No target source", "Select a delayed source to compare against.");
-		dm->last_delay_valid = false;
+	if (!dm->ref && !dm->ref_name.empty())
+		connect_ref(dm);
+	if (!dm->target && !dm->target_name.empty())
+		connect_target(dm);
+
+	if (!dm || !dm->target || !dm->ref) {
+		set_result(dm, "---", "Select both reference and target sources.", false);
 		return false;
 	}
 
@@ -520,21 +636,18 @@ static bool perform_measure(struct audio_sync_data *dm)
 	const uint64_t max_age_ns = (uint64_t)(dm->window_ms + dm->max_lag_ms + 200u) * 1000000ULL; // grace window
 
 	if (!has_recent_audio(last_ref_ns, now_ns, max_age_ns)) {
-		set_result(dm, "Reference inactive", "No recent audio on reference source.");
-		dm->last_delay_valid = false;
+		set_result(dm, "---", "No recent audio on reference source.", false);
 		return false;
 	}
 
 	if (!has_recent_audio(last_tgt_ns, now_ns, max_age_ns)) {
-		set_result(dm, "Target inactive", "No recent audio on target source.");
-		dm->last_delay_valid = false;
+		set_result(dm, "---", "No recent audio on target source.", false);
 		return false;
 	}
 
 	if (!enough) {
-		set_result(dm, "Not enough audio data available",
-			   "Need more buffered audio from both reference and target before measuring.");
-		dm->last_delay_valid = false;
+		set_result(dm, "---", "Need more buffered audio from both reference and target before measuring.",
+			   false);
 		return false;
 	}
 
@@ -543,57 +656,172 @@ static bool perform_measure(struct audio_sync_data *dm)
 
 	blog(LOG_INFO, "[ADM] Estimating Audio Delay");
 	if (estimate_delay(dm, &delay_ms, &corr)) {
-	std::string target_name_copy;
+		std::string target_name_copy;
 
-	pthread_mutex_lock(&dm->lock);
-	target_name_copy = dm->target_name;
-	pthread_mutex_unlock(&dm->lock);
+		pthread_mutex_lock(&dm->lock);
+		target_name_copy = dm->target_name;
+		dm->last_correlation = (float)corr;
+		pthread_mutex_unlock(&dm->lock);
 
-	char buffer[256];
-	snprintf(buffer, sizeof(buffer), "%+6.1f ms (correlation: %.2f)", delay_ms, corr);
-	char notes_buf[256];
-	if (delay_ms > 0) {
-		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' lags reference by %.1f ms",
-			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", delay_ms);
-	} else if (delay_ms < 0) {
-		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' leads reference by %.1f ms",
-			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", fabs(delay_ms));
-	} else {
-		snprintf(notes_buf, sizeof(notes_buf), "Target '%s' is aligned with reference",
-			 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>");
+		char buffer[256];
+		snprintf(buffer, sizeof(buffer), "%+6.1f ms", delay_ms);
+		char notes_buf[256];
+		if (delay_ms > 0) {
+			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' lags reference by %.1f ms (corr=%.2f)",
+				 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", delay_ms, corr);
+		} else if (delay_ms < 0) {
+			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' leads reference by %.1f ms (corr=%.2f)",
+				 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", fabs(delay_ms),
+				 corr);
+		} else {
+			snprintf(notes_buf, sizeof(notes_buf), "Target '%s' is aligned with reference (corr=%.2f)",
+				 !target_name_copy.empty() ? target_name_copy.c_str() : "<target>", corr);
+		}
+
+		set_result(dm, buffer, notes_buf, true);
+		dm->last_delay_ms = delay_ms;
+		dm->last_delay_valid = true;
+		return true;
 	}
 
-	set_result(dm, buffer, notes_buf);
-	dm->last_delay_ms = delay_ms;
-	dm->last_delay_valid = true;
-	return true;
-}
-
-	set_result(dm, "Insufficient correlation - check audio levels and similarity",
-		   "Insufficient correlation; ensure both sources carry similar program audio.");
-	dm->last_delay_valid = false;
+	set_result(dm, "---", "Insufficient correlation; ensure both sources carry similar program audio.", false);
 	return false;
 }
 
-// ✅ FIXED: Correct signature - only 3 parameters (void* data)
-static bool measure_now_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+static void measure_now(audio_sync_data *dm)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(property);
-	auto *dm = static_cast<audio_sync_data *>(data);
-	/* Always return true so OBS refreshes the properties view even when measurement
-	 * fails (e.g., missing target or not enough buffered audio). */
 	perform_measure(dm);
-	return true;
 }
 
-static bool apply_sync_offset_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+static void *measure_average_worker(void *param)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(property);
-	auto *dm = static_cast<audio_sync_data *>(data);
+	auto *dm = static_cast<audio_sync_data *>(param);
 	if (!dm)
-		return true;
+		return nullptr;
+
+	std::vector<measurement_sample> samples;
+	samples.reserve(10);
+
+	for (int i = 0; i < 10; ++i) {
+		pthread_mutex_lock(&dm->lock);
+		bool stop = dm->average_stop;
+		pthread_mutex_unlock(&dm->lock);
+		if (stop)
+			break;
+
+		measurement_sample sample;
+		try_measure_once(dm, sample);
+		samples.push_back(sample);
+
+		if (i < 9)
+			os_sleep_ms(400);
+	}
+
+	std::string notes;
+	std::vector<measurement_sample> successes;
+	successes.reserve(samples.size());
+
+	for (size_t i = 0; i < samples.size(); ++i) {
+		const auto &s = samples[i];
+		if (s.success) {
+			successes.push_back(s);
+		}
+		if (dm->debug_enabled) {
+			char line[160];
+			if (s.success) {
+				snprintf(line, sizeof(line), "%2zu: %+6.1f ms (corr=%.2f)", i + 1, s.delay_ms,
+					 s.correlation);
+			} else {
+				snprintf(line, sizeof(line), "%2zu: fail (%s)", i + 1, s.status.c_str());
+			}
+			if (!notes.empty())
+				notes += "\n";
+			notes += line;
+		}
+	}
+
+	double avg_delay = 0.0;
+	double avg_corr = 0.0;
+	bool have_result = false;
+
+	if (!successes.empty()) {
+		std::sort(successes.begin(), successes.end(),
+			  [](const measurement_sample &a, const measurement_sample &b) {
+				  return a.correlation > b.correlation;
+			  });
+		const size_t take = std::min<size_t>(4, successes.size());
+		double sum_delay = 0.0;
+		double sum_corr = 0.0;
+		for (size_t i = 0; i < take; ++i) {
+			sum_delay += successes[i].delay_ms;
+			sum_corr += successes[i].correlation;
+		}
+		avg_delay = sum_delay / (double)take;
+		avg_corr = sum_corr / (double)take;
+		have_result = true;
+	}
+
+	if (have_result) {
+		char buffer[256];
+		snprintf(buffer, sizeof(buffer), "%+6.1f ms", avg_delay);
+		const char *details = dm->debug_enabled ? notes.c_str() : "Average completed (top 4 used).";
+		set_result(dm, buffer, details, true);
+		pthread_mutex_lock(&dm->lock);
+		dm->last_delay_ms = avg_delay;
+		dm->last_delay_valid = true;
+		dm->last_correlation = (float)avg_corr;
+		pthread_mutex_unlock(&dm->lock);
+	} else {
+		set_result(dm, "Average failed", notes.empty() ? "No successful measurements" : notes.c_str(), false);
+		pthread_mutex_lock(&dm->lock);
+		dm->last_delay_valid = false;
+		pthread_mutex_unlock(&dm->lock);
+	}
+
+	pthread_mutex_lock(&dm->lock);
+	dm->average_in_progress = false;
+	dm->average_thread_active = false;
+	pthread_mutex_unlock(&dm->lock);
+	blog(LOG_INFO, "[ADM Trace] Measure Thread Complete");
+	return nullptr;
+}
+
+static void measure_average(audio_sync_data *dm)
+{
+	if (!dm)
+		return;
+
+	pthread_mutex_lock(&dm->lock);
+	if (dm->average_in_progress) {
+		pthread_mutex_unlock(&dm->lock);
+		return;
+	}
+	dm->average_in_progress = true;
+	dm->average_stop = false;
+	pthread_mutex_unlock(&dm->lock);
+
+	if (pthread_create(&dm->average_thread, nullptr, measure_average_worker, dm) != 0) {
+		pthread_mutex_lock(&dm->lock);
+		dm->average_in_progress = false;
+		pthread_mutex_unlock(&dm->lock);
+		set_result(dm, "Error", "Could not start background measurement thread.", false);
+		return;
+	}
+
+	pthread_mutex_lock(&dm->lock);
+	dm->average_thread_active = true;
+	pthread_mutex_unlock(&dm->lock);
+
+	set_result(dm, "Averaging...", "Collecting 10 measurements over 1 second.", false);
+	pthread_mutex_lock(&dm->lock);
+	dm->last_delay_valid = false;
+	pthread_mutex_unlock(&dm->lock);
+}
+
+static void apply_sync_offset(audio_sync_data *dm)
+{
+	if (!dm)
+		return;
 
 	pthread_mutex_lock(&dm->lock);
 	bool valid = dm->last_delay_valid;
@@ -601,184 +829,411 @@ static bool apply_sync_offset_clicked(obs_properties_t *props, obs_property_t *p
 	pthread_mutex_unlock(&dm->lock);
 
 	if (!valid) {
-		set_result(dm, " No recent measurement", "Run Measure Now before applying offset.");
-		return true;
+		set_result(dm, "No Data", "Run Measure Now before applying offset.", false);
+		return;
 	}
 
-	obs_source_t *parent = obs_filter_get_parent(dm->context);
-	if (!parent) {
-		set_result(dm, " No parent source", "Cannot apply offset without a parent source.");
-		return true;
-	}
+	obs_source_t *ref = nullptr;
+	pthread_mutex_lock(&dm->lock);
+	ref = dm->ref ? obs_source_get_ref(dm->ref) : nullptr;
+	pthread_mutex_unlock(&dm->lock);
 
-	parent = obs_source_get_ref(parent);
-	if (!parent) {
-		set_result(dm, " Parent unavailable", "Parent source vanished before applying offset.");
-		return true;
+	if (!ref) {
+		set_result(dm, "No Reference", "Select a reference source first.", false);
+		return;
 	}
 
 	int64_t offset_ns = (int64_t)llround(delay_ms * 1000000.0);
-	obs_source_set_sync_offset(parent, offset_ns);
-	obs_source_release(parent);
+	obs_source_set_sync_offset(ref, offset_ns);
+	obs_source_release(ref);
 
 	char msg[128];
-	snprintf(msg, sizeof(msg), "Applied %+0.1f ms to Sync Offset", delay_ms);
-	set_result(dm, msg, "Sync Offset updated on reference source.");
-	return true;
+	snprintf(msg, sizeof(msg), "✓ %+0.1f", delay_ms);
+	set_result(dm, msg, "Sync Offset updated on reference source.", true);
 }
 
-static struct obs_audio_data *audio_sync_filter_audio(void *data, struct obs_audio_data *audio)
+// ──────────────────────────────────────────────────────────────
+//  Dockable Live Analyzer
+// ──────────────────────────────────────────────────────────────
+#include <QDockWidget>
+#include <QPointer>
+#include <QLabel>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QSpinBox>
+#include <QDoubleSpinBox>
+#include <QPushButton>
+#include <QTextEdit>
+#include <QScrollBar>
+#include <QVBoxLayout>
+#include <QMainWindow>
+#include <QWidget>
+#include <QToolButton>
+#include <QStyle>
+
+static void populate_source_combo(QComboBox *combo, const std::string &current)
 {
-	auto *dm = static_cast<audio_sync_data *>(data);
-	if (!dm)
-		return audio;
+	combo->clear();
+	obs_enum_sources(
+		[](void *data, obs_source_t *src) {
+			auto *c = static_cast<QComboBox *>(data);
+			uint32_t flags = obs_source_get_output_flags(src);
+			if (!(flags & OBS_SOURCE_AUDIO))
+				return true;
+			const char *name = obs_source_get_name(src);
+			c->addItem(QString::fromUtf8(name));
+			return true;
+		},
+		combo);
+	int idx = combo->findText(QString::fromStdString(current));
+	if (idx >= 0)
+		combo->setCurrentIndex(idx);
+}
 
-	if (!dm->target)
-		connect_target(dm);
+class SyncDockWidget : public QWidget {
+	Q_OBJECT
+public:
+	QLabel *delayLabel;
+	QLabel *corrLabel;
+	QLabel *sourceLabel;
+	QTextEdit *logView;
+	audio_sync_data *dm;
+	QToolButton *btnSettings;
+	QPushButton *btnApply;
 
-	if (!dm->target) {
-		return audio;
+	explicit SyncDockWidget(audio_sync_data *data) : QWidget(nullptr), dm(data)
+	{
+		setWindowTitle("Audio Sync Analyzer");
+		auto *lay = new QVBoxLayout(this);
+
+		sourceLabel = new QLabel("Reference ↔ Target");
+		sourceLabel->setAlignment(Qt::AlignCenter);
+		sourceLabel->setStyleSheet(
+			"font-weight: 600; border: 1px solid #666; border-radius: 4px; padding: 4px; background: transparent;");
+		delayLabel = new QLabel("---");
+		delayLabel->setStyleSheet(
+			"font-size: 14px; font-weight: bold; color: #2e9afe; border: 1px solid #666; border-radius: 4px; padding: 4px; ");
+		delayLabel->setAlignment(Qt::AlignCenter);
+		corrLabel = new QLabel("Corr: --");
+		corrLabel->setAlignment(Qt::AlignCenter);
+		corrLabel->setStyleSheet("border: 1px solid #666; border-radius: 4px; padding: 4px; ");
+
+		auto *btnMeasure = new QPushButton("Measure");
+		btnMeasure->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+		auto *btnAvg = new QPushButton("Avg");
+		btnAvg->setMinimumWidth(56);
+
+		btnSettings = new QToolButton();
+		btnSettings->setText(QString::fromUtf8("\u2699")); // gear symbol
+		btnSettings->setStyleSheet("font-size: 18px;");
+		btnSettings->setToolButtonStyle(Qt::ToolButtonTextOnly);
+		btnSettings->setAutoRaise(true);
+		btnSettings->setFixedSize(28, 28);
+		btnSettings->setToolTip("Settings");
+
+		btnApply = new QPushButton("Apply");
+		btnApply->setEnabled(false);
+
+		logView = new QTextEdit;
+		logView->setReadOnly(true);
+		logView->setMaximumHeight(160);
+		logView->setMaximumWidth(360);
+		logView->setLineWrapMode(QTextEdit::WidgetWidth);
+
+		// Top row: sources + settings on the right
+		auto *topRow = new QHBoxLayout();
+		topRow->addWidget(sourceLabel, 1);
+		topRow->addWidget(btnSettings, 0, Qt::AlignRight);
+		lay->addLayout(topRow);
+
+		// Result row: delay/corr with Apply on the right
+		auto *resultCol = new QVBoxLayout();
+		resultCol->addWidget(delayLabel);
+		resultCol->addWidget(corrLabel);
+		auto *resultRow = new QHBoxLayout();
+		resultRow->addLayout(resultCol, 1);
+		resultRow->addWidget(btnApply);
+		lay->addLayout(resultRow);
+
+		auto *row = new QHBoxLayout();
+		row->addWidget(btnMeasure, 1);
+		row->addWidget(btnAvg);
+		lay->addLayout(row);
+		lay->addWidget(logView);
+		lay->addStretch();
+
+		connect(btnMeasure, &QPushButton::clicked, this, [this]() { measure_now(dm); });
+		connect(btnAvg, &QPushButton::clicked, this, [this]() { measure_average(dm); });
+		connect(btnApply, &QPushButton::clicked, this, [this]() { apply_sync_offset(dm); });
+		connect(btnSettings, &QPushButton::clicked, this, [this]() { openSettingsDialog(); });
+
+		// Initialize labels with current names
+		updateSourceNames(QString::fromStdString(dm->ref_name), QString::fromStdString(dm->target_name));
 	}
 
-	const float *samples = as_float_channel((const uint8_t *const *)audio->data, dm->audio_format);
-	if (samples && audio->frames > 0) {
+public slots:
+	void updateResult(const QString &delay, const QString &notes, bool valid)
+	{
+		delayLabel->setText(delay);
 		pthread_mutex_lock(&dm->lock);
-		ring_write(dm->ref_buffer, dm->capacity, &dm->ref_pos, &dm->ref_count, samples, audio->frames);
-		dm->last_ref_ns = os_gettime_ns();
+		const double corr = dm ? dm->last_correlation : 0.0;
+		const QString ref = QString::fromStdString(dm->ref_name.empty() ? "<ref>" : dm->ref_name);
+		const QString tgt = QString::fromStdString(dm->target_name.empty() ? "<target>" : dm->target_name);
 		pthread_mutex_unlock(&dm->lock);
+		corrLabel->setText(QString("Corr: %1").arg(corr, 0, 'f', 2));
+		updateSourceNames(ref, tgt);
+		logView->setPlainText(notes);
+		logView->verticalScrollBar()->setValue(logView->verticalScrollBar()->maximum());
+		btnApply->setEnabled(valid);
 	}
-	return audio;
-}
 
-static void audio_sync_destroy(void *data)
+	void updateSourceNames(const QString &ref, const QString &tgt)
+	{
+		const QString refSafe = ref.isEmpty() ? "<ref>" : ref;
+		const QString tgtSafe = tgt.isEmpty() ? "<target>" : tgt;
+		sourceLabel->setText(QString("%1  ↔  %2").arg(refSafe, tgtSafe));
+	}
+
+private:
+	void openSettingsDialog()
+	{
+		if (!dm)
+			return;
+
+		QDialog dlg(this);
+		dlg.setWindowTitle("Audio Sync Analyzer Settings");
+		auto *layout = new QFormLayout(&dlg);
+
+		auto *refCombo = new QComboBox(&dlg);
+		auto *tgtCombo = new QComboBox(&dlg);
+		auto *winSpin = new QSpinBox(&dlg);
+		auto *lagSpin = new QSpinBox(&dlg);
+		auto *corrSpin = new QDoubleSpinBox(&dlg);
+
+		winSpin->setMinimumWidth(120);
+		lagSpin->setMinimumWidth(120);
+		corrSpin->setMinimumWidth(120);
+
+		winSpin->setRange(MIN_WINDOW_MS, MAX_WINDOW_MS);
+		winSpin->setSingleStep(50);
+		lagSpin->setRange(50, MAX_LAG_MS);
+		lagSpin->setSingleStep(25);
+		corrSpin->setRange(0.0, 1.0);
+		corrSpin->setSingleStep(0.01);
+		corrSpin->setDecimals(2);
+
+		std::string ref_name;
+		std::string tgt_name;
+		uint32_t window_ms = DEFAULT_WINDOW_MS;
+		uint32_t max_lag_ms = 500;
+		float corr_threshold = MIN_CORR_THRESHOLD;
+
+		pthread_mutex_lock(&dm->lock);
+		ref_name = dm->ref_name;
+		tgt_name = dm->target_name;
+		window_ms = dm->window_ms;
+		max_lag_ms = dm->max_lag_ms;
+		corr_threshold = dm->corr_threshold;
+		pthread_mutex_unlock(&dm->lock);
+
+		populate_source_combo(refCombo, ref_name);
+		populate_source_combo(tgtCombo, tgt_name);
+		winSpin->setValue((int)window_ms);
+		lagSpin->setValue((int)max_lag_ms);
+		corrSpin->setValue((double)corr_threshold);
+
+		layout->addRow("Reference Source", refCombo);
+		layout->addRow("Target Source", tgtCombo);
+		layout->addRow("Analysis Window (ms)", winSpin);
+		layout->addRow("Max Lag (ms)", lagSpin);
+		layout->addRow("Correlation Threshold", corrSpin);
+
+		auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+		layout->addWidget(buttons);
+		QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+		QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+		if (dlg.exec() != QDialog::Accepted)
+			return;
+
+		std::string new_ref = refCombo->currentText().toStdString();
+		std::string new_tgt = tgtCombo->currentText().toStdString();
+		uint32_t new_win = (uint32_t)winSpin->value();
+		uint32_t new_lag = (uint32_t)lagSpin->value();
+		float new_corr = (float)corrSpin->value();
+
+		pthread_mutex_lock(&dm->lock);
+		dm->ref_name = new_ref;
+		dm->target_name = new_tgt;
+		dm->window_ms = new_win;
+		dm->max_lag_ms = new_lag;
+		dm->corr_threshold = new_corr;
+		pthread_mutex_unlock(&dm->lock);
+
+		connect_ref(dm);
+		connect_target(dm);
+	}
+};
+
+static QPointer<QDockWidget> g_syncDock;
+
+// Called from set_result after every measurement; pulls copies from dm to avoid dangling pointers
+static void update_dock_ui(audio_sync_data *dm)
 {
-	blog(LOG_INFO, "[ADM Trace] Destroy");
-	auto *dm = static_cast<audio_sync_data *>(data);
-	if (!dm)
+	blog(LOG_INFO, "[ADM DEBUG] Entering update dock ui");
+	if (!g_syncDock)
 		return;
 
-	if (dm->target) {
-		obs_source_remove_audio_capture_callback(dm->target, capture_target, dm);
-		obs_source_release(dm->target);
-		dm->target=nullptr;
+	auto *widget = qobject_cast<SyncDockWidget *>(g_syncDock->widget());
+	if (!widget)
+		return;
+
+	std::string delay_copy;
+	std::string notes_copy;
+	double corr_copy = 0.0;
+	std::string ref_name;
+	std::string tgt_name;
+	pthread_mutex_lock(&dm->lock);
+	delay_copy = dm->last_delay_text;
+	notes_copy = dm->last_delay_valid ? dm->last_notes : "";
+	corr_copy = dm->last_correlation;
+	ref_name = dm->ref_name;
+	tgt_name = dm->target_name;
+	bool valid = dm->last_delay_valid;
+	pthread_mutex_unlock(&dm->lock);
+
+	QMetaObject::invokeMethod(
+		widget,
+		[widget, delay_copy, notes_copy, corr_copy, ref_name, tgt_name, valid] {
+			Q_UNUSED(corr_copy);
+			widget->updateResult(QString::fromStdString(delay_copy), QString::fromStdString(notes_copy),
+					     valid);
+			widget->updateSourceNames(QString::fromStdString(ref_name), QString::fromStdString(tgt_name));
+		},
+		Qt::QueuedConnection);
+}
+
+static const char *k_dock_id = "audio-sync-analyzer";
+
+static void create_dock_widget()
+{
+	if (!g_dm || g_syncDock)
+		return;
+
+	g_syncDock = new QDockWidget("Audio Sync Analyzer", nullptr);
+	g_syncDock->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable |
+				QDockWidget::DockWidgetFloatable);
+	g_syncDock->setWidget(new SyncDockWidget(g_dm));
+	g_syncDock->resize(360, 500);
+	g_syncDock->setMaximumWidth(420);
+
+	obs_frontend_add_custom_qdock(k_dock_id, g_syncDock);
+
+	QObject::connect(g_syncDock, &QDockWidget::destroyed, [] {
+		obs_frontend_remove_dock(k_dock_id);
+		g_syncDock = nullptr;
+	});
+}
+
+static void destroy_dock_widget()
+{
+	if (g_syncDock) {
+		obs_frontend_remove_dock(k_dock_id);
+		g_syncDock = nullptr;
+	}
+}
+
+static void audio_sync_frontend_shutdown()
+{
+	if (!g_dm)
+		return;
+
+	destroy_dock_widget();
+
+	pthread_mutex_lock(&g_dm->lock);
+	bool join_needed = g_dm->average_thread_active;
+	g_dm->average_stop = true;
+	pthread_mutex_unlock(&g_dm->lock);
+	if (join_needed)
+		pthread_join(g_dm->average_thread, nullptr);
+
+	if (g_dm->target) {
+		obs_source_remove_audio_capture_callback(g_dm->target, capture_target, g_dm);
+		obs_source_release(g_dm->target);
+		g_dm->target = nullptr;
+	}
+	if (g_dm->ref) {
+		obs_source_remove_audio_capture_callback(g_dm->ref, capture_ref, g_dm);
+		obs_source_release(g_dm->ref);
+		g_dm->ref = nullptr;
 	}
 
-	pthread_mutex_destroy(&dm->lock);
-	bfree(dm->ref_buffer);
-	bfree(dm->tgt_buffer);
-	bfree(dm);
+	pthread_mutex_destroy(&g_dm->lock);
+	bfree(g_dm->ref_buffer);
+	bfree(g_dm->tgt_buffer);
+	delete g_dm;
+	g_dm = nullptr;
 }
 
-static void *audio_sync_create(obs_data_t *settings, obs_source_t *context)
-{
-	struct audio_sync_data *dm = static_cast<audio_sync_data *>(bzalloc(sizeof(*dm)));
-	dm->context = context;
-	pthread_mutex_init(&dm->lock, nullptr);
-
-	dm->sample_rate = audio_output_get_sample_rate(obs_get_audio());
-	dm->audio_format = AUDIO_FORMAT_FLOAT_PLANAR;
-
-	dm->capacity = ms_to_samples(BUFFER_SECONDS * 1000u, dm->sample_rate);
-	dm->ref_buffer = static_cast<float *>(bzalloc(dm->capacity * sizeof(float)));
-	dm->tgt_buffer = static_cast<float *>(bzalloc(dm->capacity * sizeof(float)));
-	dm->tgt_pos = dm->ref_pos = 0;
-	dm->tgt_count = dm->ref_count = 0;
-
-	dm->last_delay_valid = false;
-	dm->target_name = obs_data_get_string(settings, "target_source");
-	dm->debug_enabled = obs_data_get_bool(settings, "debug_enabled");
-	dm->window_ms = (uint32_t)obs_data_get_int(settings, "window_ms");
-	dm->max_lag_ms = (uint32_t)obs_data_get_int(settings, "max_lag_ms");
-	dm->corr_threshold = (float)obs_data_get_double(settings, "corr_threshold");
-
-	// Initialize bandpass filter coefficients
-	design_bandpass_filter(BANDPASS_LOW_Hz, BANDPASS_HIGH_Hz, dm->sample_rate, &dm->bp_coeffs);
-
-	obs_data_set_string(settings, "time_result", "");
-	obs_data_set_string(settings, "delay_result", "Ready...");
-	obs_data_set_string(settings, "notes", "");
-
-	blog(LOG_INFO, "[ADM TRACE] Created");
-	return dm;
-}
-
-static bool add_audio_sources(void *priv, obs_source_t *src)
-{
-	auto *list = static_cast<obs_property_t *>(priv);
-	uint32_t flags = obs_source_get_output_flags(src);
-	if (!(flags & OBS_SOURCE_AUDIO))
-		return true;
-
-	const char *name = obs_source_get_name(src);
-	obs_property_list_add_string(list, name, name);
-	return true;
-}
-
-static obs_properties_t *audio_sync_properties(void *data)
+static void tools_menu_action(void *data)
 {
 	UNUSED_PARAMETER(data);
-	blog(LOG_INFO, "[ADM TRACE] Creating Properties");
-	obs_properties_t *props = obs_properties_create();
+	if (!g_dm)
+		return;
 
-	obs_property_t *list = obs_properties_add_list(props, "target_source", "Delayed Source", OBS_COMBO_TYPE_LIST,
-						       OBS_COMBO_FORMAT_STRING);
-	obs_enum_sources(add_audio_sources, list);
+	if (!g_syncDock)
+		create_dock_widget();
 
-	obs_properties_add_button2(props, "measure_now", "Measure Now", measure_now_clicked, data);
-	obs_properties_add_button2(props, "apply_sync_offset", "Apply Sync Offset", apply_sync_offset_clicked, data);
-
-	obs_property_t *time_prop = obs_properties_add_text(props, "time_result", "Time", OBS_TEXT_INFO);
-	obs_property_set_enabled(time_prop, false);
-
-	obs_property_t *result = obs_properties_add_text(props, "delay_result", "Delay", OBS_TEXT_INFO);
-	obs_property_set_enabled(result, false);
-
-	obs_property_t *notes = obs_properties_add_text(props, "notes", "Notes", OBS_TEXT_INFO);
-	obs_property_set_enabled(notes, false);
-
-	obs_properties_add_int_slider(props, "window_ms", "Window (ms)", MIN_WINDOW_MS, MAX_WINDOW_MS, 50);
-	obs_properties_add_int_slider(props, "max_lag_ms", "Max Lag (ms)", 50, MAX_LAG_MS, 25);
-	obs_properties_add_float_slider(props, "corr_threshold", "Correlation", 0.0, 1.0, 0.01);
-	obs_properties_add_bool(props, "debug_enabled", "Enable Debug Logging");
-
-	return props;
+	if (g_syncDock) {
+		g_syncDock->show();
+		g_syncDock->raise();
+		g_syncDock->activateWindow();
+	}
 }
 
-static void audio_sync_defaults(obs_data_t *settings)
+static void audio_sync_frontend_init()
 {
-	blog(LOG_INFO, "[ADM TRACE] Setting Defaults");
-	obs_data_set_default_int(settings, "window_ms", DEFAULT_WINDOW_MS);
-	obs_data_set_default_int(settings, "max_lag_ms", 500);
-	obs_data_set_default_double(settings, "corr_threshold", (double)MIN_CORR_THRESHOLD);
-	obs_data_set_default_bool(settings, "debug_enabled", false);
-	obs_data_set_default_string(settings, "delay_result", "Ready...");
-	obs_data_set_default_string(settings, "time_result", "");
-	obs_data_set_default_string(settings, "notes", "");
-	obs_data_set_default_string(settings, "target_source", "");
+	if (g_dm)
+		return;
+
+	g_dm = new audio_sync_data();
+	pthread_mutex_init(&g_dm->lock, nullptr);
+	g_dm->sample_rate = audio_output_get_sample_rate(obs_get_audio());
+	g_dm->audio_format = AUDIO_FORMAT_FLOAT_PLANAR;
+	g_dm->capacity = ms_to_samples(BUFFER_SECONDS * 1000u, g_dm->sample_rate);
+	g_dm->ref_buffer = static_cast<float *>(bzalloc(g_dm->capacity * sizeof(float)));
+	g_dm->tgt_buffer = static_cast<float *>(bzalloc(g_dm->capacity * sizeof(float)));
+	g_dm->tgt_pos = g_dm->ref_pos = 0;
+	g_dm->tgt_count = g_dm->ref_count = 0;
+	g_dm->last_delay_valid = false;
+	g_dm->window_ms = DEFAULT_WINDOW_MS;
+	g_dm->max_lag_ms = 500;
+	g_dm->corr_threshold = MIN_CORR_THRESHOLD;
+	g_dm->debug_enabled = false;
+	g_dm->average_in_progress = false;
+	g_dm->average_stop = false;
+	g_dm->average_thread_active = false;
+
+	design_bandpass_filter(BANDPASS_LOW_Hz, BANDPASS_HIGH_Hz, g_dm->sample_rate, &g_dm->bp_coeffs);
+
+	obs_frontend_add_save_callback(frontend_save_cb, g_dm);
+	obs_frontend_add_tools_menu_item("Audio Sync Analyzer", tools_menu_action, nullptr);
+
+	create_dock_widget();
+	update_dock_ui(g_dm);
 }
 
-static const char *audio_sync_get_name(void *unused)
+extern "C" void audio_sync_frontend_init_module()
 {
-	UNUSED_PARAMETER(unused);
-	return "Audio Sync Analyzer";
+	audio_sync_frontend_init();
 }
 
-extern "C" {
-static obs_source_info make_audio_sync_filter_info()
+extern "C" void audio_sync_frontend_shutdown_module()
 {
-	obs_source_info info = {};
-	info.id = "audio-sync-analyzer";
-	info.type = OBS_SOURCE_TYPE_FILTER;
-	info.output_flags = OBS_SOURCE_AUDIO;
-	info.get_name = audio_sync_get_name;
-	info.create = audio_sync_create;
-	info.destroy = audio_sync_destroy;
-	info.update = audio_sync_update;
-	info.get_defaults = audio_sync_defaults;
-	info.get_properties = audio_sync_properties;
-	info.filter_audio = audio_sync_filter_audio;
-	return info;
+	obs_frontend_remove_save_callback(frontend_save_cb, g_dm);
+	audio_sync_frontend_shutdown();
 }
 
-struct obs_source_info audio_sync_filter = make_audio_sync_filter_info();
-}
+#include "audio-sync-analyzer.moc"

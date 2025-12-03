@@ -35,7 +35,7 @@ the Free Software Foundation; either version 2 of the License, or
 #define MAX_WINDOW_MS 3000u
 #define DEFAULT_WINDOW_MS 1000u
 #define MAX_LAG_MS 1500u
-#define MIN_CORR_THRESHOLD 0.4f
+#define MIN_CORR_THRESHOLD 0.3f
 #define BANDPASS_LOW_Hz 200.0f
 #define BANDPASS_HIGH_Hz 2000.0f
 

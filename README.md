@@ -18,21 +18,22 @@ graph LR
     C["Camera Feed Audio (Delayed Target)"] -->|"Delayed audio"| B
     B -->|"Measured delay "| D["Apply delay to Reference"]
 ```
+In practice, the delay measurement works best on plain speech.  Music with complex frequency content can result in poor correlation results.  This is presumably due to EQ differences between the sources.
 
 ## Usage
 
 1. Enable the dock from the OBS Tools menu - Tools -> Audio Sync Analyzer.
-2. Provide a significant audio source level that is captured by both audio inputs of interest
+2. Provide a significant audio source level that is captured by both audio inputs of interest. **Plain speech works best.**
 3. Select the non-delayed input source (typically straight from audio mixer)
 4. Select the audio source associated with one of the cameras as the 'target' audio device
-5. Click on 'Measure'
+5. Click on 'Measure' repeatedly to get an idea how consistent the measurements are.  Shoot for correlation > 0.6 if possible.  Try the Average button.
 6. If delay is reasonable, click on 'Apply'
 
 In a multi-camera situation where each camera delays are not similar, each camera can be adjusted to match the mixer audio by reversing the measurement above.
 
 ## Implementation Details
 
-- **Preprocessing**: Each analysis window (default 1 s) is copied from ring buffers for the reference and target. Audio is converted to mono float, DC offset is removed, optional bandpass applied, pre-emphasis is applied, and a Hann window tapers the edges.
+- **Preprocessing**: Each analysis window (default 1 s) is copied from ring buffers for the reference and target. Audio is converted to mono float, DC offset is removed, bandpass filter applied, pre-emphasis is applied, and a Hann window tapers the edges.
 - **FFT Cross-Correlation**: Both signals are zero-padded to the next power of two and transformed with FFT. The cross-spectrum is `FFT(ref) * conj(FFT(tgt))`; an inverse FFT yields the time-domain cross-correlation sequence.
 - **Normalization**: Energy for each overlap is computed via prefix sums. Correlation at each lag is normalized by `sqrt(energy_ref * energy_tgt)`, making the score scale-invariant to gain differences.
 - **Lag Search**: Lags are searched within the configured max lag (default 500 ms, capped by window). Only overlaps with at least 1024 samples are considered. The best correlation peak above the threshold is selected; delay is `(lag * 1000 / sample_rate) ms`.
